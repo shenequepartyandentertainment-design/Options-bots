@@ -1,0 +1,116 @@
+"""
+Signal bot: SPY, SPX, TSLA, SOXS, MU, AVGO
+Checks daily technicals and alerts you when a ticker flips to BUY or SELL.
+
+Setup:
+    pip install yfinance pandas requests
+Run once:      python signal_bot.py
+Loop (30 min): python signal_bot.py --loop
+Or schedule with cron after market close (4:15pm ET).
+
+Telegram alerts (optional): set env vars TELEGRAM_TOKEN and TELEGRAM_CHAT_ID.
+Without them, alerts print to the console.
+
+NOT financial advice. Signals are simple technical rules and will be wrong often.
+"""
+import json, os, sys, time
+from pathlib import Path
+
+import pandas as pd
+import requests
+import yfinance as yf
+
+TICKERS = {"SPY": "SPY", "SPX": "^GSPC", "TSLA": "TSLA",
+           "SOXS": "SOXS", "MU": "MU", "AVGO": "AVGO"}
+STATE_FILE = Path("signal_state.json")
+CHECK_EVERY_SECONDS = 1800
+
+
+def rsi(close, n=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + gain / loss)
+
+
+def analyze(symbol):
+    df = yf.download(symbol, period="1y", interval="1d",
+                     auto_adjust=True, progress=False)
+    if df.empty or len(df) < 200:
+        return None
+    close = df["Close"].squeeze()
+
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    r = rsi(close)
+    ema12, ema26 = close.ewm(span=12).mean(), close.ewm(span=26).mean()
+    macd = ema12 - ema26
+    sig = macd.ewm(span=9).mean()
+
+    price = float(close.iloc[-1])
+    score, reasons = 0, []
+
+    # Trend
+    if price > sma50.iloc[-1] > sma200.iloc[-1]:
+        score += 1; reasons.append("uptrend (price > 50d > 200d)")
+    elif price < sma50.iloc[-1] < sma200.iloc[-1]:
+        score -= 1; reasons.append("downtrend (price < 50d < 200d)")
+
+    # RSI
+    if r.iloc[-1] < 30:
+        score += 1; reasons.append(f"RSI oversold {r.iloc[-1]:.0f}")
+    elif r.iloc[-1] > 70:
+        score -= 1; reasons.append(f"RSI overbought {r.iloc[-1]:.0f}")
+
+    # MACD cross within the last 2 days
+    cross_up = (macd.iloc[-1] > sig.iloc[-1]) and (macd.iloc[-3] <= sig.iloc[-3])
+    cross_dn = (macd.iloc[-1] < sig.iloc[-1]) and (macd.iloc[-3] >= sig.iloc[-3])
+    if cross_up:
+        score += 1; reasons.append("MACD bullish cross")
+    elif cross_dn:
+        score -= 1; reasons.append("MACD bearish cross")
+
+    signal = "BUY" if score >= 2 else "SELL" if score <= -2 else "HOLD"
+    return {"price": price, "signal": signal, "score": score,
+            "rsi": float(r.iloc[-1]), "reasons": reasons}
+
+
+def notify(msg):
+    print(msg)
+    token, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if token and chat:
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data={"chat_id": chat, "text": msg}, timeout=10)
+        except requests.RequestException as e:
+            print("Telegram error:", e)
+
+
+def run_once():
+    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    for name, symbol in TICKERS.items():
+        try:
+            res = analyze(symbol)
+        except Exception as e:
+            print(f"{name}: error {e}")
+            continue
+        if not res:
+            print(f"{name}: not enough data")
+            continue
+        print(f"{name:5} ${res['price']:.2f}  {res['signal']:4}  "
+              f"score {res['score']:+d}  RSI {res['rsi']:.0f}")
+        prev = state.get(name)
+        if res["signal"] != prev and res["signal"] in ("BUY", "SELL"):
+            notify(f"{res['signal']} {name} @ ${res['price']:.2f}\n"
+                   + "\n".join("- " + x for x in res["reasons"]))
+        state[name] = res["signal"]
+    STATE_FILE.write_text(json.dumps(state))
+
+
+if __name__ == "__main__":
+    if "--loop" in sys.argv:
+        while True:
+            run_once()
+            time.sleep(CHECK_EVERY_SECONDS)
+    else:
+        run_once()
