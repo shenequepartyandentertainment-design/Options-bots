@@ -1,0 +1,143 @@
+"""
+Options idea scanner: SPY, SPX(^GSPC), TSLA, SOXS, MU, AVGO
+
+Finds DEFINED-RISK credit spreads (30-45 DTE) that match the trend:
+  - uptrend   -> bull put spread
+  - downtrend -> bear call spread
+Filters for liquidity, ~20-30 delta short strike, decent credit/width,
+and implied vol richer than realized vol. Ranks by a simple score.
+
+Setup:  pip install yfinance pandas numpy
+Run:    python options_bot.py
+
+This ranks ideas. It does NOT place trades and cannot guarantee profit.
+Not financial advice. Options can lose 100% of the amount risked.
+"""
+import math
+from datetime import date, datetime
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+TICKERS = {"SPY": "SPY", "SPX": "^GSPC", "TSLA": "TSLA",
+           "SOXS": "SOXS", "MU": "MU", "AVGO": "AVGO"}
+MIN_DTE, MAX_DTE = 30, 45
+SHORT_DELTA = (0.15, 0.30)     # absolute delta range for the short strike
+MIN_CREDIT_PCT = 0.25          # credit as fraction of spread width
+MAX_BID_ASK_PCT = 0.15         # skip illiquid contracts
+MIN_OI = 100
+RISK = 0.01                    # suggested max risk per trade (1% of account)
+
+
+def norm_cdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def bs_delta(S, K, T, iv, is_call, r=0.04):
+    if T <= 0 or iv <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + (r + iv ** 2 / 2) * T) / (iv * math.sqrt(T))
+    return norm_cdf(d1) if is_call else norm_cdf(d1) - 1
+
+
+def mid(row):
+    return (row.bid + row.ask) / 2
+
+
+def liquid(row):
+    m = mid(row)
+    return (row.bid > 0 and m > 0 and (row.ask - row.bid) / m <= MAX_BID_ASK_PCT
+            and (row.openInterest or 0) >= MIN_OI)
+
+
+def trend_and_vol(symbol):
+    h = yf.download(symbol, period="1y", interval="1d",
+                    auto_adjust=True, progress=False)
+    if len(h) < 200:
+        return None
+    c = h["Close"].squeeze()
+    price = float(c.iloc[-1])
+    sma50, sma200 = c.rolling(50).mean().iloc[-1], c.rolling(200).mean().iloc[-1]
+    hv30 = float(np.log(c / c.shift(1)).tail(30).std() * math.sqrt(252))
+    if price > sma50 > sma200:
+        trend = "up"
+    elif price < sma50 < sma200:
+        trend = "down"
+    else:
+        trend = "none"
+    return price, trend, hv30
+
+
+def best_spread(symbol, price, trend, hv30):
+    tk = yf.Ticker(symbol)
+    ideas = []
+    for exp in tk.options:
+        dte = (datetime.strptime(exp, "%Y-%m-%d").date() - date.today()).days
+        if not MIN_DTE <= dte <= MAX_DTE:
+            continue
+        chain = tk.option_chain(exp)
+        is_call = trend == "down"
+        df = (chain.calls if is_call else chain.puts).copy()
+        df = df[df.apply(liquid, axis=1)].sort_values("strike").reset_index(drop=True)
+        T = dte / 365
+        for i, short in df.iterrows():
+            d = abs(bs_delta(price, short.strike, T, short.impliedVolatility, is_call))
+            if not SHORT_DELTA[0] <= d <= SHORT_DELTA[1]:
+                continue
+            # long leg is the next strike further OTM (try a few widths)
+            for j in range(1, 4):
+                k = i + j if is_call else i - j
+                if k < 0 or k >= len(df):
+                    continue
+                lng = df.iloc[k]
+                width = abs(lng.strike - short.strike)
+                credit = mid(short) - mid(lng)
+                if width <= 0 or credit <= 0 or credit / width < MIN_CREDIT_PCT:
+                    continue
+                max_loss = width - credit
+                pop = 1 - d
+                ev = pop * credit - (1 - pop) * max_loss  # per share, rough
+                iv_edge = short.impliedVolatility / hv30 if hv30 else 1
+                ideas.append({
+                    "symbol": symbol, "type": "Bear call" if is_call else "Bull put",
+                    "exp": exp, "dte": dte,
+                    "short": short.strike, "long": lng.strike,
+                    "credit": round(credit, 2), "max_loss": round(max_loss, 2),
+                    "pop%": round(pop * 100), "ev/sh": round(ev, 2),
+                    "iv/hv": round(iv_edge, 2),
+                    "score": round(ev / max_loss + 0.1 * (iv_edge - 1), 3),
+                })
+    return ideas
+
+
+def main():
+    all_ideas = []
+    for name, sym in TICKERS.items():
+        try:
+            tv = trend_and_vol(sym)
+            if not tv:
+                print(f"{name}: not enough data"); continue
+            price, trend, hv30 = tv
+            print(f"{name:5} ${price:.2f}  trend={trend}  HV30={hv30:.0%}")
+            if trend == "none":
+                continue
+            ideas = best_spread(sym, price, trend, hv30)
+            all_ideas += sorted(ideas, key=lambda x: -x["score"])[:2]
+        except Exception as e:
+            print(f"{name}: error {e}")
+
+    if not all_ideas:
+        print("\nNo setups pass the filters today. Doing nothing is a valid trade.")
+        return
+    out = pd.DataFrame(all_ideas).sort_values("score", ascending=False)
+    print("\nTop ideas (per-share figures; x100 per contract):\n")
+    print(out.to_string(index=False))
+    print(f"\nSize so max loss <= {RISK:.0%} of account: "
+          "contracts = (account * 0.01) / (max_loss * 100)")
+    print("Check earnings dates, avoid holding through them, and close at "
+          "~50% of max profit or 21 DTE.")
+
+
+if __name__ == "__main__":
+    main()
