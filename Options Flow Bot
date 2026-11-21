@@ -1,0 +1,29 @@
+name: Options Flow Bot
+on:
+  schedule:
+    - cron: "0 13 * * 1-5"   # 9 AM ET during EDT
+    - cron: "0 14 * * 1-5"   # 9 AM ET during EST
+  workflow_dispatch:          # manual "Run" button for testing
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 390
+    steps:
+      - name: Only proceed if it's 9 AM ET
+        id: gate
+        run: |
+          [ "$(TZ=America/New_York date +%H)" = "09" ] || echo "skip=true" >> $GITHUB_OUTPUT
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.skip != 'true'
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.skip != 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+        if: steps.gate.outputs.skip != 'true'
+      - run: python options_flow_bot.py
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
